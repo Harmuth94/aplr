@@ -409,6 +409,141 @@ bool check_changed_static_data()
     return same_term_fit(copied, uncached);
 }
 
+bool check_pruned_gate_cache_lifetime()
+{
+    Eigen::MatrixXd X(20, 1);
+    X.col(0) = VectorXd::LinSpaced(20, -3.0, 4.0);
+    const VectorXd gradient{(X.col(0).array() - 1.0).max(0.0).matrix()};
+    const VectorXd weights{VectorXd::Ones(20)};
+    const std::vector<Term> gates{Term(0, {}, 0.0, true, 1.0)};
+    Term reused(0, gates);
+    reused.estimate_split_point(X, gradient, weights, 8, 0.2, 1, false, 0.1, 0.0, 0.001, 1.0);
+    if (!reused.given_terms.empty())
+    {
+        std::cerr << "pruning fixture did not remove its same-predictor gate\n";
+        return false;
+    }
+    const auto original_bins{reused.bins_start_index};
+    const VectorXd original_values{reused.values_discretized};
+    const VectorXd original_weights{reused.sample_weight_discretized};
+    // Removing the gate exposes rows, but upstream retains the candidate's
+    // original bin representatives, weight sums and positions through this step.
+    if (!check_exhaustive_selection(X, gradient * 0.7, weights * 1.3, 8, 0, {}, &reused) ||
+        reused.bins_start_index != original_bins ||
+        !(reused.values_discretized.array() == original_values.array()).all() ||
+        !(reused.sample_weight_discretized.array() == original_weights.array()).all())
+        return false;
+
+    Term changed(0, gates);
+    changed.estimate_split_point(X, gradient, weights, 8, 0.2, 1, false, 0.1, 0.0, 0.001, 1.0);
+    X.col(0).reverseInPlace();
+    VectorXd counts{VectorXd::Ones(20)};
+    counts[3] = 4.0;
+    changed.estimate_split_point(X, gradient, weights, counts, 8, 0.2, 1, false, 0.1, 0.0, 0.001, 1.0);
+    Term fresh(0);
+    fresh.estimate_split_point(X, gradient, weights, counts, 8, 0.2, 1, false, 0.1, 0.0, 0.001, 1.0);
+    if (!same_term_fit(changed, fresh))
+    {
+        std::cerr << "pruned gate preserved bins across an explicit input change\n";
+        return false;
+    }
+    return true;
+}
+
+bool check_expanded_pruning_and_historical_error_scale()
+{
+    Eigen::MatrixXd X(18, 1);
+    VectorXd gradient(18), weights(18);
+    const double values[]{-3.0, -1.0, 0.5, 1.5, 3.0, 5.0};
+    for (Eigen::Index row = 0; row < X.rows(); ++row)
+    {
+        X(row, 0) = values[row / 3];
+        gradient[row] = std::max(0.0, X(row, 0) - 1.0) + 0.03 * (row % 3);
+        weights[row] = 0.5 + 0.4 * (row % 3);
+    }
+    auto grouped{aplr_internal::aggregate_identical_rows(X, gradient, weights)};
+    ExpandedScoringContext context;
+    context.X = &X;
+    context.negative_gradient = &gradient;
+    context.sample_weight = &weights;
+    auto refresh_offset = [&]() {
+        grouped = aplr_internal::aggregate_identical_rows(X, gradient, weights);
+        context.error_offset = (gradient.array().square() * weights.array()).sum() -
+            (grouped.y.array().square() * grouped.sample_weight.array()).sum();
+    };
+    Term original_main(0), compressed_main(0);
+    const std::vector<Term> gates{Term(0, {}, 0.0, true, 1.0)};
+    Term original_pruned(0, gates), compressed_pruned(0, gates);
+    double prior_offset{NAN_DOUBLE};
+    for (size_t step = 0; step < 3; ++step)
+    {
+        refresh_offset();
+        original_main.estimate_split_point(X, gradient, weights, 8, 0.2, 1, false, 0.1, 0.0, 0.001, 1.0);
+        compressed_main.estimate_split_point(grouped.X, grouped.y, grouped.sample_weight,
+            grouped.observation_count, 8, 0.2, 1, false, 0.1, 0.0, 0.001, 1.0, false, &context);
+        if (!same_term_fit(original_main, compressed_main))
+        {
+            std::cerr << "compressed historical search error lost changing full-row variance\n";
+            return false;
+        }
+        original_pruned.estimate_split_point(X, gradient, weights, 8, 0.2, 1, false, 0.1, 0.0, 0.001, 1.0);
+        compressed_pruned.estimate_split_point(grouped.X, grouped.y, grouped.sample_weight,
+            grouped.observation_count, 8, 0.2, 1, false, 0.1, 0.0, 0.001, 1.0, false, &context);
+        if (!same_term_fit(original_pruned, compressed_pruned) ||
+            !compressed_pruned.given_terms.empty() ||
+            (step > 0 && (original_pruned.bins_start_index != compressed_pruned.bins_start_index ||
+                          original_pruned.bins_end_index != compressed_pruned.bins_end_index)))
+        {
+            std::cerr << "expanded fallback changed legacy bins or full-row scoring after gate pruning\n";
+            return false;
+        }
+        if (step > 0 && context.error_offset == prior_offset)
+            return false;
+        prior_offset = context.error_offset;
+        for (Eigen::Index row = 0; row < X.rows(); ++row)
+        {
+            gradient[row] = 0.8 * gradient[row] + 0.02 * (row % 3);
+            weights[row] *= row % 2 ? 1.2 : 0.7;
+        }
+    }
+    return true;
+}
+
+bool check_original_final_reduction_order()
+{
+    // The gate removes only rows where the indicator is already zero. Both
+    // terms predict the same function, but upstream sums their errors in
+    // different sorted/gated orders and compares the saved scores strictly.
+    Eigen::MatrixXd X(18, 2);
+    VectorXd gradient(18), weights(18);
+    for (Eigen::Index row = 0; row < X.rows(); ++row)
+    {
+        const Eigen::Index group{row / 3};
+        X(row, 0) = group >= 3 ? 1.0 : 0.0;
+        X(row, 1) = group == 0 ? 3.0 : 0.25 * group;
+        gradient[row] = 0.2 * (row % 7) - 0.1 * (row % 3);
+        weights[row] = row == 7 ? 0.0 : 1.0 + 0.2 * (row % 5);
+    }
+    const auto grouped{aplr_internal::aggregate_identical_rows(X, gradient, weights)};
+    ExpandedScoringContext context{&X, &gradient, &weights,
+        (gradient.array().square() * weights.array()).sum() -
+        (grouped.y.array().square() * grouped.sample_weight.array()).sum()};
+    for (const auto &gates : {std::vector<Term>{}, std::vector<Term>{Term(1, {}, 2.0, false, 1.0)}})
+    {
+        Term original(0, gates), compressed(0, gates);
+        original.estimate_split_point(X, gradient, weights, 8, 0.2, 1, true, 0.0, 0.0, 0.2, 3.0, true);
+        compressed.estimate_split_point(grouped.X, grouped.y, grouped.sample_weight,
+            grouped.observation_count, 8, 0.2, 1, true, 0.0, 0.0, 0.2, 3.0, true, &context);
+        if (original.coefficient != compressed.coefficient ||
+            original.split_point_search_errors_sum != compressed.split_point_search_errors_sum)
+        {
+            std::cerr << "original final coefficient/error reduction order was not preserved\n";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool check_expanded_endpoint_eligibility()
 {
     Eigen::MatrixXd compressed(3, 1);
@@ -544,6 +679,9 @@ int main()
         "near tie right", x, near_tie_y, weights, 0.0, 4, 7, 0);
     passed &= check_sort_cache_refresh();
     passed &= check_changed_static_data();
+    passed &= check_pruned_gate_cache_lifetime();
+    passed &= check_expanded_pruning_and_historical_error_scale();
+    passed &= check_original_final_reduction_order();
     passed &= check_expanded_endpoint_eligibility();
     passed &= check_candidate_selection_cases();
     passed &= check_reusable_prefix_buffer();

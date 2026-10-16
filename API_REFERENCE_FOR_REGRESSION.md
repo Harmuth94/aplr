@@ -173,6 +173,9 @@ Training rows with identical transformed feature values are combined within
 each cross-validation fold using summed sample weights and weighted targets.
 Validation rows remain unchanged. Original observation counts are retained for
 bin construction and minimum-observation split thresholds.
+Original training data and derivative vectors are retained for final
+coefficient/error scoring and to preserve bin behavior after redundant gates
+are pruned. Aggregation therefore does not guarantee lower peak memory.
 
 This option supports built-in `poisson` with a `log` link and built-in `tweedie`
 with a `log` link and `1 < dispersion_parameter < 2`. It requires

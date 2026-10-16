@@ -26,6 +26,17 @@ struct SortedData
     VectorXi row_indexes_sorted{VectorXi(0)};
 };
 
+// Original-row derivatives keep historical candidate errors on their upstream
+// scale. Only Terms whose own gate pruning changes legacy bin membership need
+// to use the full row vectors for subsequent split scoring.
+struct ExpandedScoringContext
+{
+    const MatrixXd *X{nullptr};
+    const VectorXd *negative_gradient{nullptr};
+    const VectorXd *sample_weight{nullptr};
+    double error_offset{0.0}; // Full-row null SSE minus aggregated null SSE.
+};
+
 struct InteractionConstraintsTest
 {
     bool term_adheres_to_combination;
@@ -52,6 +63,21 @@ private:
     std::vector<aplr_internal::HingeScore> approximate_right_scores;
     bool static_main_effect_data_cached{false};
     VectorXi cached_active_rows;
+    SortedData original_final_scoring_vectors;
+    VectorXi original_final_active_rows;
+    size_t original_final_base_term{0};
+    void rescore_on_original_rows(const ExpandedScoringContext &context,
+                                 const std::vector<Term> &given_terms_before_search);
+    bool uses_expanded_scoring{false};
+    bool expanded_bin_indexes_installed{false};
+    VectorXd expanded_unit_observation_count;
+    std::vector<size_t> expanded_bins_start_index;
+    std::vector<size_t> expanded_bins_end_index;
+    bool pending_pruned_gate_transition{false};
+    MatrixXd input_before_pruned_gate_transition;
+    VectorXd counts_before_pruned_gate_transition;
+    std::vector<Term> expected_given_terms_after_pruning;
+    static bool same_gate_definitions(const std::vector<Term> &left, const std::vector<Term> &right);
     size_t cached_base_term{0};
     size_t cached_bins{0};
     size_t cached_min_observations_in_split{0};
@@ -122,7 +148,8 @@ public:
                               const VectorXd &observation_count, size_t bins, double v,
                               size_t min_observations_in_split, bool linear_effects_only_in_this_boosting_step,
                               double penalty_for_non_linearity, double penalty_for_interactions, double ridge_penalty,
-                              double ridge_penalty_weight, bool estimate_coefficient_only = false);
+                              double ridge_penalty_weight, bool estimate_coefficient_only = false,
+                              const ExpandedScoringContext *context = nullptr);
     // Keep the historical native call available to callers without aggregation.
     void estimate_split_point(const MatrixXd &X, const VectorXd &negative_gradient,
                               const VectorXd &sample_weight, size_t bins, double v,
@@ -210,12 +237,35 @@ bool operator==(const Term &p1, const Term &p2)
     return cmp_ex_given_terms && cmp_given_terms;
 }
 
-void Term::estimate_split_point(const MatrixXd &X, const VectorXd &negative_gradient, const VectorXd &sample_weight,
-                                const VectorXd &observation_count, size_t bins, double v,
+void Term::estimate_split_point(const MatrixXd &input_X, const VectorXd &input_negative_gradient, const VectorXd &input_sample_weight,
+                                const VectorXd &input_observation_count, size_t bins, double v,
                                 size_t min_observations_in_split, bool linear_effects_only_in_this_boosting_step,
                                 double penalty_for_non_linearity, double penalty_for_interactions, double ridge_penalty,
-                                double ridge_penalty_weight, bool estimate_coefficient_only)
+                                double ridge_penalty_weight, bool estimate_coefficient_only,
+                                const ExpandedScoringContext *context)
 {
+    const bool scoring_expanded_rows{uses_expanded_scoring && context};
+    const std::vector<Term> given_terms_before_search{context && !scoring_expanded_rows ? given_terms : std::vector<Term>{}};
+    if (scoring_expanded_rows && (!context->X || !context->negative_gradient || !context->sample_weight))
+        throw std::runtime_error("Original-row derivatives are required after aggregated gate pruning.");
+    if (scoring_expanded_rows && expanded_unit_observation_count.size() != context->X->rows())
+        expanded_unit_observation_count = VectorXd::Ones(context->X->rows());
+    const MatrixXd &X{scoring_expanded_rows ? *context->X : input_X};
+    const VectorXd &negative_gradient{scoring_expanded_rows ? *context->negative_gradient : input_negative_gradient};
+    const VectorXd &sample_weight{scoring_expanded_rows ? *context->sample_weight : input_sample_weight};
+    const VectorXd &observation_count{scoring_expanded_rows ? expanded_unit_observation_count : input_observation_count};
+    const bool installing_expanded_bins{scoring_expanded_rows && !expanded_bin_indexes_installed};
+    if (installing_expanded_bins)
+    {
+        bins_start_index = expanded_bins_start_index;
+        bins_end_index = expanded_bins_end_index;
+        observations_in_bins.resize(bins_start_index.size());
+        for (size_t i = 0; i < bins_start_index.size(); ++i)
+            observations_in_bins[i] = bins_end_index[i] - bins_start_index[i] + 1;
+        sorted_vectors.row_indexes_sorted.resize(0);
+        static_main_effect_data_cached = false;
+        expanded_bin_indexes_installed = true;
+    }
     bool learning_rate_is_zero{is_approximately_zero(v)};
     if (learning_rate_is_zero)
     {
@@ -228,12 +278,22 @@ void Term::estimate_split_point(const MatrixXd &X, const VectorXd &negative_grad
     const bool may_reuse_main_rows{given_terms.empty() && static_main_effect_data_cached};
     if (!may_reuse_main_rows)
         calculate_rows_to_zero_out_and_not_due_to_given_terms(X);
-    bool cache_matches{sorted_vectors.row_indexes_sorted.size() > 0 &&
+    // Upstream fixes bins for a candidate's entire lifetime, including when its
+    // own search prunes redundant same-predictor gates. Preserve that transition
+    // only for the exact same input and the gates produced by the prior search.
+    const bool expected_pruning_transition{pending_pruned_gate_transition &&
+        input_before_pruned_gate_transition.rows() == X.rows() &&
+        input_before_pruned_gate_transition.cols() == X.cols() &&
+        (input_before_pruned_gate_transition.array() == X.array()).all() &&
+        counts_before_pruned_gate_transition.size() == observation_count.size() &&
+        (counts_before_pruned_gate_transition.array() == observation_count.array()).all() &&
+        same_gate_definitions(given_terms, expected_given_terms_after_pruning)};
+    bool cache_matches{installing_expanded_bins || (sorted_vectors.row_indexes_sorted.size() > 0 &&
         cached_base_term == base_term && cached_bins == bins &&
         cached_min_observations_in_split == min_observations_in_split &&
-        (may_reuse_main_rows ? sorted_vectors.row_indexes_sorted.size() == X.rows() :
+        (expected_pruning_transition || (may_reuse_main_rows ? sorted_vectors.row_indexes_sorted.size() == X.rows() :
             cached_active_rows.size() == rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.size() &&
-            (cached_active_rows.array() == rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.array()).all())};
+            (cached_active_rows.array() == rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.array()).all())))};
     if (cache_matches)
         for (Eigen::Index i = 0; i < sorted_vectors.row_indexes_sorted.size(); ++i)
         {
@@ -248,9 +308,20 @@ void Term::estimate_split_point(const MatrixXd &X, const VectorXd &negative_grad
     if (!cache_matches)
     {
         cleanup_after_fit();
+        // Invalidating static input does not change the selected row domain.
+        uses_expanded_scoring = scoring_expanded_rows;
+        expanded_bin_indexes_installed = scoring_expanded_rows;
+        if (scoring_expanded_rows)
+            expanded_unit_observation_count = VectorXd::Ones(X.rows());
         if (may_reuse_main_rows)
             calculate_rows_to_zero_out_and_not_due_to_given_terms(X);
     }
+    if (cache_matches && expected_pruning_transition)
+        sorted_vectors.row_indexes_sorted.resize(0); // The pruned gate can expose additional rows.
+    pending_pruned_gate_transition = false;
+    input_before_pruned_gate_transition.resize(0, 0);
+    counts_before_pruned_gate_transition.resize(0);
+    expected_given_terms_after_pruning.clear();
     const bool reuse_main_effect_cache{cache_matches && may_reuse_main_rows};
     double active_observation_count{0.0};
     if (reuse_main_effect_cache)
@@ -290,8 +361,23 @@ void Term::estimate_split_point(const MatrixXd &X, const VectorXd &negative_grad
     }
     estimate_coefficient_and_error(calculate_without_interactions(sorted_vectors.values_sorted), sorted_vectors.negative_gradient_sorted,
                                    sorted_vectors.sample_weight_sorted, error_where_given_terms_are_zero);
+    if (pending_pruned_gate_transition)
+    {
+        input_before_pruned_gate_transition = X;
+        counts_before_pruned_gate_transition = observation_count;
+        expected_given_terms_after_pruning = given_terms;
+    }
     cleanup_after_estimate_split_point();
     determine_if_can_be_used_as_a_given_term(X.col(base_term));
+    if (context && !scoring_expanded_rows)
+    {
+        // Historical partner selection uses strict comparisons, including ties
+        // between equivalent gated terms. Reproduce the original row order and
+        // reduction for the final coefficient/error, after compressed split search.
+        rescore_on_original_rows(*context, given_terms_before_search);
+        if (pending_pruned_gate_transition && (input_observation_count.array() > 1.0).any())
+            uses_expanded_scoring = true;
+    }
 }
 
 void Term::calculate_rows_to_zero_out_and_not_due_to_given_terms(const MatrixXd &X)
@@ -582,6 +668,13 @@ void Term::setup_bins()
         for (size_t i = 0; i < static_cast<size_t>(sorted_vectors.values_sorted.size()); ++i)
             expanded_positions[i + 1] = expanded_positions[i] +
                 static_cast<size_t>(sorted_vectors.observation_count_sorted[i]);
+        expanded_bins_start_index.resize(bins_start_index.size());
+        expanded_bins_end_index.resize(bins_start_index.size());
+        for (size_t i = 0; i < bins_start_index.size(); ++i)
+        {
+            expanded_bins_start_index[i] = expanded_positions[bins_start_index[i]];
+            expanded_bins_end_index[i] = expanded_positions[bins_end_index[i] + 1] - 1;
+        }
         const size_t expanded_max_index{static_cast<size_t>(observation_count_total) - 1};
         for (size_t i = 0; i < bins_start_index.size(); ++i)
         {
@@ -843,7 +936,67 @@ void Term::prune_given_terms()
             new_given_terms.push_back(given_terms[given_term_index]);
         }
         given_terms = std::move(new_given_terms);
+        pending_pruned_gate_transition = true;
     }
+}
+
+void Term::rescore_on_original_rows(const ExpandedScoringContext &context,
+                                   const std::vector<Term> &given_terms_before_search)
+{
+    if (!context.X || !context.negative_gradient || !context.sample_weight)
+        throw std::runtime_error("Original-row derivatives are required for aggregated final scoring.");
+    const auto &X{*context.X};
+    const auto &gradient{*context.negative_gradient};
+    const auto &weights{*context.sample_weight};
+    // Upstream sorts using the gates present before split selection/pruning.
+    Term original(base_term, given_terms_before_search);
+    original.calculate_rows_to_zero_out_and_not_due_to_given_terms(X);
+    const auto &active{original.rows_to_zero_out_and_not_due_to_given_terms.not_zeroed};
+    bool order_matches{original_final_base_term == base_term &&
+        original_final_active_rows.size() == active.size() &&
+        original_final_scoring_vectors.row_indexes_sorted.size() == active.size() &&
+        (original_final_active_rows.array() == active.array()).all()};
+    if (order_matches)
+        for (Eigen::Index i = 0; i < original_final_scoring_vectors.row_indexes_sorted.size(); ++i)
+            if (original_final_scoring_vectors.values_sorted[i] !=
+                X(original_final_scoring_vectors.row_indexes_sorted[i], base_term))
+            {
+                order_matches = false;
+                break;
+            }
+    if (!order_matches)
+    {
+        original.sort_vectors_ascending_by_base_term(X, gradient, weights, VectorXd::Ones(X.rows()));
+        original_final_scoring_vectors.values_sorted = std::move(original.sorted_vectors.values_sorted);
+        original_final_scoring_vectors.row_indexes_sorted = std::move(original.sorted_vectors.row_indexes_sorted);
+        original_final_active_rows = active;
+        original_final_base_term = base_term;
+    }
+    auto &sorted{original_final_scoring_vectors};
+    sorted.negative_gradient_sorted.resize(sorted.row_indexes_sorted.size());
+    sorted.sample_weight_sorted.resize(sorted.row_indexes_sorted.size());
+    for (Eigen::Index i = 0; i < sorted.row_indexes_sorted.size(); ++i)
+    {
+        sorted.negative_gradient_sorted[i] = gradient[sorted.row_indexes_sorted[i]];
+        sorted.sample_weight_sorted[i] = weights[sorted.row_indexes_sorted[i]];
+    }
+    original.calculate_error_where_given_terms_are_zero(gradient, weights);
+    estimate_coefficient_and_error(calculate_without_interactions(sorted.values_sorted),
+        sorted.negative_gradient_sorted, sorted.sample_weight_sorted,
+        original.error_where_given_terms_are_zero);
+}
+
+bool Term::same_gate_definitions(const std::vector<Term> &left, const std::vector<Term> &right)
+{
+    if (left.size() != right.size())
+        return false;
+    for (size_t i = 0; i < left.size(); ++i)
+        if (left[i].base_term != right[i].base_term || left[i].direction_right != right[i].direction_right ||
+            (!(std::isnan(left[i].split_point) && std::isnan(right[i].split_point)) &&
+             left[i].split_point != right[i].split_point) ||
+            !same_gate_definitions(left[i].given_terms, right[i].given_terms))
+            return false;
+    return true;
 }
 
 void Term::cleanup_after_estimate_split_point()
@@ -881,6 +1034,17 @@ void Term::cleanup_after_fit()
     approximate_left_scores.clear();
     approximate_right_scores.clear();
     cached_active_rows.resize(0);
+    original_final_scoring_vectors = SortedData{};
+    original_final_active_rows.resize(0);
+    uses_expanded_scoring = false;
+    expanded_bin_indexes_installed = false;
+    expanded_unit_observation_count.resize(0);
+    expanded_bins_start_index.clear();
+    expanded_bins_end_index.clear();
+    pending_pruned_gate_transition = false;
+    input_before_pruned_gate_transition.resize(0, 0);
+    counts_before_pruned_gate_transition.resize(0);
+    expected_given_terms_after_pruning.clear();
     values_discretized.resize(0);
     sample_weight_discretized.resize(0);
     sorted_vectors.values_sorted.resize(0);

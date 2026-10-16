@@ -47,6 +47,17 @@ private:
     std::vector<size_t> validation_indexes;
     VectorXd sample_weight_train;
     VectorXd observation_count_train;
+    // Aggregated folds retain original rows and derivatives for scalar
+    // updates and final candidate scoring. Candidates whose gate pruning
+    // exposes partial groups also search splits on the original rows.
+    MatrixXd X_train_original;
+    VectorXd y_train_original;
+    VectorXd sample_weight_train_original;
+    VectorXi training_row_to_group;
+    VectorXd original_gradient_over_hessian;
+    VectorXd original_fitting_weight;
+    ExpandedScoringContext expanded_scoring_context;
+    bool expanded_scoring_vectors_current{false};
     MatrixXd X_validation;
     VectorXd y_validation;
     VectorXd sample_weight_validation;
@@ -146,6 +157,7 @@ private:
                                              const VectorXi &cv_observations_in_fold, const VectorXi &group, const MatrixXd &other_data);
     void validate_row_aggregation_configuration(const VectorXi &group, const MatrixXd &other_data);
     void aggregate_training_rows_if_requested();
+    void prepare_expanded_scoring_vectors();
     void initialize(const std::vector<int> &monotonic_constraints);
     bool check_if_base_term_has_only_one_unique_value(size_t base_term);
     void add_term_to_terms_eligible_current(Term &term);
@@ -1468,6 +1480,14 @@ void APLRRegressor::aggregate_training_rows_if_requested()
     min_response_train_before_aggregation = y_train.minCoeff() / scaling_factor_for_log_link_function;
     max_response_train_before_aggregation = y_train.maxCoeff() / scaling_factor_for_log_link_function;
     auto aggregated = aplr_internal::aggregate_identical_rows(X_train, y_train, sample_weight_train);
+    X_train_original = std::move(X_train);
+    y_train_original = std::move(y_train);
+    sample_weight_train_original = std::move(sample_weight_train);
+    training_row_to_group = std::move(aggregated.row_to_group);
+    expanded_scoring_context.X = &X_train_original;
+    expanded_scoring_context.negative_gradient = &original_gradient_over_hessian;
+    expanded_scoring_context.sample_weight = &original_fitting_weight;
+    expanded_scoring_vectors_current = false;
     X_train = std::move(aggregated.X);
     y_train = std::move(aggregated.y);
     sample_weight_train = std::move(aggregated.sample_weight);
@@ -1521,7 +1541,7 @@ void APLRRegressor::initialize(const std::vector<int> &monotonic_constraints)
         }
     }
 
-    sample_weight_train_sum = sample_weight_train.sum();
+    sample_weight_train_sum = row_aggregation_active ? sample_weight_train_original.sum() : sample_weight_train.sum();
     skip_hessian = (loss_function == "mse" && link_function == "identity") ||
                    loss_function == "binomial" || link_function == "logit";
     if (skip_hessian)
@@ -1568,7 +1588,9 @@ void APLRRegressor::initialize(const std::vector<int> &monotonic_constraints)
     ridge_penalty_weights.resize(X_train.cols());
     for (Eigen::Index i = 0; i < X_train.cols(); ++i)
     {
-        ridge_penalty_weights[i] = (X_train.col(i).array() * sample_weight_train.array() * X_train.col(i).array()).sum();
+        const MatrixXd &ridge_X = row_aggregation_active ? X_train_original : X_train;
+        const VectorXd &ridge_weight = row_aggregation_active ? sample_weight_train_original : sample_weight_train;
+        ridge_penalty_weights[i] = (ridge_X.col(i).array() * ridge_weight.array() * ridge_X.col(i).array()).sum();
     }
 }
 
@@ -1993,7 +2015,10 @@ void APLRRegressor::execute_boosting_step(size_t boosting_step, Eigen::Index fol
 void APLRRegressor::update_intercept(size_t boosting_step)
 {
     double intercept_update;
-    intercept_update = v * (neg_gradient_current_over_hessian.array() * sample_weight_train_for_fitting.array()).sum() / sample_weight_train_for_fitting.array().sum();
+    if (row_aggregation_active)
+        intercept_update = v * (original_gradient_over_hessian.array() * original_fitting_weight.array()).sum() / original_fitting_weight.array().sum();
+    else
+        intercept_update = v * (neg_gradient_current_over_hessian.array() * sample_weight_train_for_fitting.array()).sum() / sample_weight_train_for_fitting.array().sum();
     if (model_has_changed_in_this_boosting_step == false)
         model_has_changed_in_this_boosting_step = !is_approximately_equal(intercept_update, 0.0);
     linear_predictor_update = VectorXd::Constant(neg_gradient_current_over_hessian.size(), intercept_update);
@@ -2033,6 +2058,7 @@ void APLRRegressor::update_linear_predictor_and_predictions()
 
 void APLRRegressor::update_gradient_and_errors()
 {
+    expanded_scoring_vectors_current = false;
     bool poisson_log_case{loss_function == "poisson" && link_function == "log" && !skip_hessian};
     if (poisson_log_case)
     {
@@ -2075,6 +2101,60 @@ void APLRRegressor::update_gradient_and_errors()
             sample_weight_train_for_fitting *= (sample_weight_train_sum / fitting_weight_sum);
     }
     neg_gradient_nullmodel_errors_sum = calculate_sum_error(calculate_errors(neg_gradient_current_over_hessian, linear_predictor_null_model, sample_weight_train_for_fitting, MSE_LOSS_FUNCTION));
+    if (row_aggregation_active)
+    {
+        // Historical candidate errors are compared across derivative updates
+        // when selecting interaction partners. Keep them on the original-row
+        // scale, whose within-group variance can change at every update.
+        prepare_expanded_scoring_vectors();
+    }
+}
+
+void APLRRegressor::prepare_expanded_scoring_vectors()
+{
+    if (!row_aggregation_active || expanded_scoring_vectors_current)
+        return;
+    VectorXd predictions_original(training_row_to_group.size());
+    for (Eigen::Index i = 0; i < training_row_to_group.size(); ++i)
+        predictions_original[i] = predictions_current[training_row_to_group[i]];
+    VectorXd hessian_original;
+    if (loss_function == "poisson")
+    {
+        original_gradient_over_hessian.resize(y_train_original.size());
+        hessian_original.resize(y_train_original.size());
+        for (Eigen::Index i = 0; i < y_train_original.size(); ++i)
+        {
+            double prediction = predictions_original[i];
+            double gradient_mu = y_train_original[i] / prediction - 1.0;
+            double hessian = (y_train_original[i] / (prediction * prediction)) * prediction * prediction - gradient_mu * prediction;
+            if (!std::isfinite(hessian))
+                hessian = 1.0;
+            else if (!(hessian > 0.0))
+                hessian = 1e-4;
+            hessian_original[i] = hessian;
+            original_gradient_over_hessian[i] = gradient_mu * prediction / hessian;
+        }
+    }
+    else
+    {
+        // Use the same built-in Tweedie derivatives and chain-rule order as
+        // calculate_neg_gradient_current()/calculate_hessian_current().
+        const double d = dispersion_parameter;
+        VectorXd gradient_mu = (y_train_original.array() - predictions_original.array()) * predictions_original.array().pow(-d);
+        hessian_original = (1.0 - d) * predictions_original.array().pow(-d) + d * y_train_original.array() * predictions_original.array().pow(-d - 1.0);
+        hessian_original = hessian_original.array() * predictions_original.array() * predictions_original.array() - gradient_mu.array() * predictions_original.array();
+        hessian_original = hessian_original.array().isFinite().select((hessian_original.array() > 0.0).select(hessian_original, 1e-4), 1.0);
+        original_gradient_over_hessian = (gradient_mu.array() * predictions_original.array() / hessian_original.array()).matrix();
+    }
+    original_fitting_weight = sample_weight_train_original.array() * hessian_original.array();
+    const double fitting_weight_sum = original_fitting_weight.sum();
+    if (fitting_weight_sum > 0.0)
+        original_fitting_weight *= sample_weight_train_sum / fitting_weight_sum;
+    const double full_null_error = calculate_sum_error((original_gradient_over_hessian.array().square() * original_fitting_weight.array()).matrix());
+    const double error_offset = full_null_error - neg_gradient_nullmodel_errors_sum;
+    expanded_scoring_context.error_offset = std::isfinite(error_offset) ? error_offset : 0.0;
+    neg_gradient_nullmodel_errors_sum = full_null_error;
+    expanded_scoring_vectors_current = true;
 }
 
 std::vector<size_t> APLRRegressor::find_terms_eligible_current_indexes_for_a_base_term(size_t base_term)
@@ -2093,6 +2173,13 @@ std::vector<size_t> APLRRegressor::find_terms_eligible_current_indexes_for_a_bas
 
 void APLRRegressor::estimate_split_point_for_each_term(std::vector<Term> &terms, std::vector<size_t> &terms_indexes)
 {
+    if (row_aggregation_active)
+        for (const auto index : terms_indexes)
+            if (terms[index].uses_expanded_scoring)
+            {
+                prepare_expanded_scoring_vectors();
+                break;
+            }
     bool multithreading{cores_to_use > 1 && terms_indexes.size() > 1};
 
     if (multithreading)
@@ -2112,7 +2199,8 @@ void APLRRegressor::estimate_split_point_for_each_term(std::vector<Term> &terms,
                                            this->predictor_penalties_for_non_linearity[term_ptr->base_term],
                                            this->predictor_penalties_for_interactions[term_ptr->base_term],
                                            this->ridge_penalty,
-                                           this->ridge_penalty_weights[term_ptr->base_term]); }));
+                                           this->ridge_penalty_weights[term_ptr->base_term], false,
+                                           this->row_aggregation_active ? &this->expanded_scoring_context : nullptr); }));
         }
         for (auto &&result : results)
         {
@@ -2130,7 +2218,8 @@ void APLRRegressor::estimate_split_point_for_each_term(std::vector<Term> &terms,
                                                          predictor_penalties_for_non_linearity[terms[terms_indexes[i]].base_term],
                                                          predictor_penalties_for_interactions[terms[terms_indexes[i]].base_term],
                                                          ridge_penalty,
-                                                         ridge_penalty_weights[terms[terms_indexes[i]].base_term]);
+                                                         ridge_penalty_weights[terms[terms_indexes[i]].base_term], false,
+                                                         row_aggregation_active ? &expanded_scoring_context : nullptr);
         }
     }
 }
@@ -2614,6 +2703,8 @@ void APLRRegressor::update_term_eligibility()
 void APLRRegressor::update_a_term_coefficient_round_robin(size_t boosting_step)
 {
     update_intercept(boosting_step);
+    if (row_aggregation_active && terms_eligible_current[term_to_update_in_this_boosting_step].uses_expanded_scoring)
+        prepare_expanded_scoring_vectors();
     terms_eligible_current[term_to_update_in_this_boosting_step].estimate_split_point(X_train, neg_gradient_current_over_hessian, sample_weight_train_for_fitting,
                                                                                       observation_count_train, bins,
                                                                                       predictor_learning_rates[terms_eligible_current[term_to_update_in_this_boosting_step].base_term],
@@ -2623,7 +2714,7 @@ void APLRRegressor::update_a_term_coefficient_round_robin(size_t boosting_step)
                                                                                       predictor_penalties_for_interactions[terms_eligible_current[term_to_update_in_this_boosting_step].base_term],
                                                                                       ridge_penalty,
                                                                                       ridge_penalty_weights[terms_eligible_current[term_to_update_in_this_boosting_step].base_term],
-                                                                                      true);
+                                                                                      true, row_aggregation_active ? &expanded_scoring_context : nullptr);
     terms[term_to_update_in_this_boosting_step].coefficient += terms_eligible_current[term_to_update_in_this_boosting_step].coefficient;
     linear_predictor_update = terms_eligible_current[term_to_update_in_this_boosting_step].calculate_contribution_to_linear_predictor(X_train);
     linear_predictor_update_validation = terms_eligible_current[term_to_update_in_this_boosting_step].calculate_contribution_to_linear_predictor(X_validation);
@@ -2793,9 +2884,12 @@ void APLRRegressor::correct_mean_bias()
 {
     if (link_function == "identity" || link_function == "log")
     {
-        VectorXd predictions_train{predict_internal(X_train, false)};
-        double mean_y = calculate_weighted_average(y_train, sample_weight_train);
-        double mean_pred = calculate_weighted_average(predictions_train, sample_weight_train);
+        const MatrixXd &bias_X = row_aggregation_active ? X_train_original : X_train;
+        const VectorXd &bias_y = row_aggregation_active ? y_train_original : y_train;
+        const VectorXd &bias_weight = row_aggregation_active ? sample_weight_train_original : sample_weight_train;
+        VectorXd predictions_train{predict_internal(bias_X, false)};
+        double mean_y = calculate_weighted_average(bias_y, bias_weight);
+        double mean_pred = calculate_weighted_average(predictions_train, bias_weight);
 
         double bias_adjustment = 0.0;
         if (link_function == "identity")
@@ -3068,7 +3162,7 @@ void APLRRegressor::write_output_to_cv_fold_models(Eigen::Index fold_index)
     cv_fold_models[fold_index].fold_index = fold_index;
     cv_fold_models[fold_index].min_training_prediction_or_response = min_training_prediction_or_response;
     cv_fold_models[fold_index].max_training_prediction_or_response = max_training_prediction_or_response;
-    cv_fold_models[fold_index].sample_weight_train_sum = sample_weight_train.sum();
+    cv_fold_models[fold_index].sample_weight_train_sum = sample_weight_train_sum;
 }
 
 void APLRRegressor::cleanup_after_fit()
@@ -3079,6 +3173,14 @@ void APLRRegressor::cleanup_after_fit()
     validation_indexes.clear();
     sample_weight_train.resize(0);
     observation_count_train.resize(0);
+    X_train_original.resize(0, 0);
+    y_train_original.resize(0);
+    sample_weight_train_original.resize(0);
+    training_row_to_group.resize(0);
+    original_gradient_over_hessian.resize(0);
+    original_fitting_weight.resize(0);
+    expanded_scoring_context = ExpandedScoringContext{};
+    expanded_scoring_vectors_current = false;
     X_validation.resize(0, 0);
     y_validation.resize(0);
     sample_weight_validation.resize(0);

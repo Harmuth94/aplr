@@ -3,7 +3,7 @@
 The comparison uses independently installed upstream and candidate wheels in
 separate Python environments. Every fit runs in a fresh process, with imports
 and synthetic data generation outside the fit timer. The benchmark reports fit
-time, prediction time, process peak resident memory, package versions, extension
+time, prediction time, CPU time, process peak resident memory, package versions, extension
 hashes, aggregation diagnostics, and numerical differences.
 
 All data is generated locally from seed zero. The default campaign covers
@@ -42,3 +42,5 @@ Performance varies with hardware and the data distribution; timing is reported
 rather than asserted in CI. Peak memory includes the interpreter, data,
 fitted model, predictions, and retained comparison arrays. Identical-row
 aggregation can cost time when few rows can be combined.
+It retains original training rows for compatible final scoring, so fewer
+working rows do not necessarily mean lower process peak memory.

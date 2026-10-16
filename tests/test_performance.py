@@ -1,7 +1,10 @@
 """Regression coverage for standard APLR's optional training-row aggregation."""
 
 import inspect
+import importlib.util
+import json
 import pickle
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -272,3 +275,26 @@ def test_pickle_round_trip_and_old_native_and_python_state():
     assert old_model.aggregate_identical_rows is False
     assert old_model.get_aggregation_diagnostics() == []
     np.testing.assert_array_equal(old_model.predict(X), model.predict(X))
+
+
+def test_late_tweedie_validation_history_matches_upstream():
+    # Final predictions alone miss a split-scoring regression after step 60.
+    # Keep the full curve produced by genuine upstream, including later steps
+    # that were not selected for the final model.
+    directory = Path(__file__).resolve().parent
+    fixture = json.loads(
+        (directory / "fixtures" / "standard_tweedie_validation_history.json").read_text()
+    )
+    specification = importlib.util.spec_from_file_location(
+        "aplr_benchmark_standard", directory.parent / "benchmarks" / "benchmark_standard.py"
+    )
+    benchmark = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(benchmark)
+    X, y, weight, cv = benchmark.synthetic_data(10000, 0.0, "tweedie")
+    model = APLRRegressor(**fixture["parameters"])
+    model.fit(X, y, sample_weight=weight, cv_observations=cv)
+    history = model.get_validation_error_steps()
+    assert history.shape == (100, 3)
+    np.testing.assert_allclose(
+        history, fixture["validation_error_steps"], rtol=1e-10, atol=1e-12,
+    )

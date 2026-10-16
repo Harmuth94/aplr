@@ -15,6 +15,7 @@ struct AggregatedRows
     VectorXd y;
     VectorXd sample_weight;
     VectorXd observation_count;
+    VectorXi row_to_group;
 };
 
 inline AggregatedRows aggregate_identical_rows(
@@ -33,6 +34,7 @@ inline AggregatedRows aggregate_identical_rows(
     target_sums.reserve(static_cast<size_t>(X.rows()));
     observation_counts.reserve(static_cast<size_t>(X.rows()));
 
+    VectorXi row_to_group(X.rows());
     for (Eigen::Index row = 0; row < X.rows(); ++row)
     {
         std::vector<double> key(static_cast<size_t>(X.cols()));
@@ -53,6 +55,7 @@ inline AggregatedRows aggregate_identical_rows(
         else
             group_index = insertion.first->second;
 
+        row_to_group[row] = static_cast<int>(group_index);
         weight_sums[group_index] += sample_weight[row];
         weighted_target_sums[group_index] += sample_weight[row] * y[row];
         target_sums[group_index] += y[row];
@@ -60,6 +63,7 @@ inline AggregatedRows aggregate_identical_rows(
     }
 
     AggregatedRows output;
+    output.row_to_group = std::move(row_to_group);
     Eigen::Index number_of_groups{
         static_cast<Eigen::Index>(first_row_indexes.size())};
     output.X.resize(number_of_groups, X.cols());

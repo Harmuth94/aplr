@@ -1,6 +1,7 @@
 name: Test standard APLR performance optimizations
 
 on:
+  push:
   pull_request:
   workflow_dispatch:
 
@@ -27,4 +28,4 @@ jobs:
           c++ -std=c++17 -O2 -pthread cpp/performance_tests.cpp -o /tmp/aplr_performance_tests
           /tmp/aplr_performance_tests
       - name: Run Python and scikit-learn regression tests
-        run: python -m pytest tests/tests.py tests/test_sklearn_compatibility.py tests/test_performance.py -q
+        run: python -m pytest tests/tests.py tests/test_sklearn_compatibility.py tests/test_performance.py tests/test_upstream_parity.py -q

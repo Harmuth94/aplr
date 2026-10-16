@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -93,10 +94,14 @@ def measure(spec, output):
             params["aggregate_identical_rows"] = spec["variant"] == "aggregated"
         model = aplr.APLRRegressor(**params)
     started = time.perf_counter()
+    cpu_started = time.process_time()
     model.fit(X, y, sample_weight=weight, cv_observations=cv)
+    fit_cpu_seconds = time.process_time() - cpu_started
     fit_seconds = time.perf_counter() - started
     started = time.perf_counter()
+    cpu_started = time.process_time()
     predictions = model.predict_proba(X) if spec["loss"] == "classifier" else model.predict(X)
+    predict_cpu_seconds = time.process_time() - cpu_started
     predict_seconds = time.perf_counter() - started
     legacy_equal = None
     if spec.get("legacy_pickle"):
@@ -124,9 +129,16 @@ def measure(spec, output):
         structure.append([term_structure(term) for term in regressor.APLRRegressor.terms])
         arrays["coefficients_" + str(index)] = regressor.get_term_coefficients()
         arrays["intercept_" + str(index)] = np.array(regressor.get_intercept())
+        arrays["optimal_m_" + str(index)] = np.array(regressor.get_optimal_m())
+        arrays["feature_importance_" + str(index)] = regressor.get_feature_importance()
+        arrays["term_importance_" + str(index)] = regressor.get_term_importance()
+        sample = X.iloc[:50] if hasattr(X, "iloc") else X[:50]
+        arrays["local_feature_contribution_" + str(index)] = regressor.calculate_local_feature_contribution(sample)
         for fold in range(regressor.get_num_cv_folds()):
             arrays["cv_predictions_%s_%s" % (index, fold)] = regressor.get_cv_validation_predictions(fold)
             arrays["cv_indexes_%s_%s" % (index, fold)] = regressor.get_cv_validation_indexes(fold)
+            arrays["cv_y_%s_%s" % (index, fold)] = regressor.get_cv_y(fold)
+            arrays["cv_weights_%s_%s" % (index, fold)] = regressor.get_cv_sample_weight(fold)
     np.savez(output.with_suffix(".npz"), **arrays)
     try:
         import resource
@@ -135,6 +147,7 @@ def measure(spec, output):
     except ImportError:
         peak_rss_mib = None
     result = dict(spec, fit_seconds=fit_seconds, predict_seconds=predict_seconds,
+                  fit_cpu_seconds=fit_cpu_seconds, predict_cpu_seconds=predict_cpu_seconds,
                   peak_rss_mib=peak_rss_mib, selected_terms=structure,
                   legacy_pickle_predictions_equal=legacy_equal,
                   parameters={key: value if not callable(value) else "custom callback"
@@ -148,6 +161,12 @@ def measure(spec, output):
         "packages": {name: importlib.metadata.version(name) for name in ("aplr", "numpy", "pandas")},
         "extension_sha256": hashlib.sha256(Path(aplr_cpp.__file__).read_bytes()).hexdigest(),
     }
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        for line in cpuinfo.read_text().splitlines():
+            if line.startswith("model name"):
+                result["environment"]["cpu_model"] = line.split(":", 1)[1].strip()
+                break
     output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
 
 
@@ -174,7 +193,10 @@ def compare(reference, candidate):
             raise AssertionError("Result arrays differ")
         for key in baseline.files:
             a, b = baseline[key], optimized[key]
-            np.testing.assert_allclose(a, b, rtol=1e-10, atol=1e-12, equal_nan=True, err_msg=key)
+            if a.dtype.kind in "iub":
+                np.testing.assert_array_equal(a, b, err_msg=key)
+            else:
+                np.testing.assert_allclose(a, b, rtol=1e-10, atol=1e-12, equal_nan=True, err_msg=key)
             finite = np.isfinite(a) & np.isfinite(b)
             maxima[key] = float(np.max(np.abs(a[finite] - b[finite]))) if finite.any() else 0.0
     return maxima
@@ -246,7 +268,15 @@ def main():
                     result = json.loads(destination.read_text())
                     if reference is None:
                         reference = destination
-                    result["parity_max_absolute_differences"] = compare(reference, destination)
+                    try:
+                        result["parity_max_absolute_differences"] = compare(reference, destination)
+                    except AssertionError:
+                        failure_directory = args.output.with_suffix(".failure")
+                        failure_directory.mkdir(parents=True, exist_ok=True)
+                        for path in (reference, destination, reference.with_suffix(".npz"), destination.with_suffix(".npz")):
+                            shutil.copy2(path, failure_directory / path.name)
+                        print("Comparison evidence retained in " + str(failure_directory), flush=True)
+                        raise
                     result.pop("selected_terms")
                     results.append(result)
                     args.output.parent.mkdir(parents=True, exist_ok=True)
