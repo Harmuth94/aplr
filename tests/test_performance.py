@@ -298,3 +298,14 @@ def test_late_tweedie_validation_history_matches_upstream():
     np.testing.assert_allclose(
         history, fixture["validation_error_steps"], rtol=1e-10, atol=1e-12,
     )
+
+
+@pytest.mark.parametrize("loss", ["poisson", "tweedie"])
+@pytest.mark.parametrize("updates", [
+    pytest.param({"mean_bias_correction": True}, id="mean-bias-correction"),
+    pytest.param({"max_terms": 3}, id="round-robin-coefficients"),
+])
+def test_aggregation_preserves_optional_training_updates(loss, updates):
+    parameters = dict(updates, m=35)
+    baseline, aggregated, X, _, _, _ = _fit_pair(loss, parameters)
+    _assert_equivalent(baseline, aggregated, X)
