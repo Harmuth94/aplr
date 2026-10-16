@@ -7,6 +7,7 @@
 #include "../dependencies/eigen-3.4.0/Eigen/Dense"
 #include "functions.h"
 #include "constants.h"
+#include "prefix_split_search.h"
 
 using namespace Eigen;
 
@@ -21,6 +22,8 @@ struct SortedData
     VectorXd values_sorted{VectorXd(0)};
     VectorXd negative_gradient_sorted{VectorXd(0)};
     VectorXd sample_weight_sorted{VectorXd(0)};
+    VectorXd observation_count_sorted{VectorXd(0)};
+    VectorXi row_indexes_sorted{VectorXi(0)};
 };
 
 struct InteractionConstraintsTest
@@ -42,6 +45,16 @@ private:
     SortedData sorted_vectors;
     VectorXd negative_gradient_discretized;
     std::vector<size_t> observations_in_bins;
+    std::vector<size_t> bins_left_active_count;
+    std::vector<size_t> bins_right_active_start;
+    aplr_internal::PrefixMoments prefix_moments;
+    std::vector<aplr_internal::HingeScore> approximate_left_scores;
+    std::vector<aplr_internal::HingeScore> approximate_right_scores;
+    bool static_main_effect_data_cached{false};
+    VectorXi cached_active_rows;
+    size_t cached_base_term{0};
+    size_t cached_bins{0};
+    size_t cached_min_observations_in_split{0};
     int monotonic_constraint;
     int interaction_constraint;
     bool linear_effects_only_in_this_boosting_step;
@@ -49,14 +62,17 @@ private:
     double penalty_for_interactions;
     double ridge_penalty;
     double ridge_penalty_weight;
+    double observation_count_total;
 
     void calculate_error_where_given_terms_are_zero(const VectorXd &negative_gradient, const VectorXd &sample_weight);
     void initialize_parameters_in_estimate_split_point(size_t bins, double v, size_t min_observations_in_split,
+                                                       double observation_count_total,
                                                        bool linear_effects_only_in_this_boosting_step,
                                                        double penalty_for_non_linearity, double penalty_for_interactions,
                                                        double ridge_penalty, double ridge_penalty_weight);
     void adjust_min_observations_in_split_to_avoid_computational_errors(size_t min_observations_in_split);
-    void sort_vectors_ascending_by_base_term(const MatrixXd &X, const VectorXd &negative_gradient, const VectorXd &sample_weight);
+    void sort_vectors_ascending_by_base_term(const MatrixXd &X, const VectorXd &negative_gradient, const VectorXd &sample_weight,
+                                             const VectorXd &observation_count);
     SortedData sort_data(const VectorXd &values_to_sort, const VectorXd &negative_gradient_to_sort, const VectorXd &sample_weight_to_sort);
     void setup_bins();
     void discretize_data_by_bin();
@@ -102,10 +118,24 @@ public:
     VectorXd calculate_contribution_to_linear_predictor(const MatrixXd &X);
     static bool equals_not_comparing_given_terms(const Term &p1, const Term &p2);
     static bool equals_given_terms(const Term &p1, const Term &p2);
-    void estimate_split_point(const MatrixXd &X, const VectorXd &negative_gradient, const VectorXd &sample_weight, size_t bins, double v,
+    void estimate_split_point(const MatrixXd &X, const VectorXd &negative_gradient, const VectorXd &sample_weight,
+                              const VectorXd &observation_count, size_t bins, double v,
                               size_t min_observations_in_split, bool linear_effects_only_in_this_boosting_step,
                               double penalty_for_non_linearity, double penalty_for_interactions, double ridge_penalty,
                               double ridge_penalty_weight, bool estimate_coefficient_only = false);
+    // Keep the historical native call available to callers without aggregation.
+    void estimate_split_point(const MatrixXd &X, const VectorXd &negative_gradient,
+                              const VectorXd &sample_weight, size_t bins, double v,
+                              size_t min_observations_in_split, bool linear_effects_only_in_this_boosting_step,
+                              double penalty_for_non_linearity, double penalty_for_interactions,
+                              double ridge_penalty, double ridge_penalty_weight,
+                              bool estimate_coefficient_only = false)
+    {
+        estimate_split_point(X, negative_gradient, sample_weight, VectorXd::Ones(X.rows()),
+            bins, v, min_observations_in_split, linear_effects_only_in_this_boosting_step,
+            penalty_for_non_linearity, penalty_for_interactions, ridge_penalty,
+            ridge_penalty_weight, estimate_coefficient_only);
+    }
     size_t get_interaction_level();
     VectorXd calculate_without_interactions(const VectorXd &x);
     void calculate_rows_to_zero_out_and_not_due_to_given_terms(const MatrixXd &X);
@@ -180,7 +210,8 @@ bool operator==(const Term &p1, const Term &p2)
     return cmp_ex_given_terms && cmp_given_terms;
 }
 
-void Term::estimate_split_point(const MatrixXd &X, const VectorXd &negative_gradient, const VectorXd &sample_weight, size_t bins, double v,
+void Term::estimate_split_point(const MatrixXd &X, const VectorXd &negative_gradient, const VectorXd &sample_weight,
+                                const VectorXd &observation_count, size_t bins, double v,
                                 size_t min_observations_in_split, bool linear_effects_only_in_this_boosting_step,
                                 double penalty_for_non_linearity, double penalty_for_interactions, double ridge_penalty,
                                 double ridge_penalty_weight, bool estimate_coefficient_only)
@@ -192,19 +223,59 @@ void Term::estimate_split_point(const MatrixXd &X, const VectorXd &negative_grad
         return;
     }
 
-    calculate_rows_to_zero_out_and_not_due_to_given_terms(X);
-
-    bool too_few_observations{static_cast<size_t>(rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.size()) < min_observations_in_split};
+    // Main effects have an invariant gate within a fold. Interactions retain
+    // their initial bins too, but refresh their gate to detect real row changes.
+    const bool may_reuse_main_rows{given_terms.empty() && static_main_effect_data_cached};
+    if (!may_reuse_main_rows)
+        calculate_rows_to_zero_out_and_not_due_to_given_terms(X);
+    bool cache_matches{sorted_vectors.row_indexes_sorted.size() > 0 &&
+        cached_base_term == base_term && cached_bins == bins &&
+        cached_min_observations_in_split == min_observations_in_split &&
+        (may_reuse_main_rows ? sorted_vectors.row_indexes_sorted.size() == X.rows() :
+            cached_active_rows.size() == rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.size() &&
+            (cached_active_rows.array() == rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.array()).all())};
+    if (cache_matches)
+        for (Eigen::Index i = 0; i < sorted_vectors.row_indexes_sorted.size(); ++i)
+        {
+            const Eigen::Index row{sorted_vectors.row_indexes_sorted[i]};
+            if (sorted_vectors.values_sorted[i] != X(row, base_term) ||
+                sorted_vectors.observation_count_sorted[i] != observation_count[row])
+            {
+                cache_matches = false;
+                break;
+            }
+        }
+    if (!cache_matches)
+    {
+        cleanup_after_fit();
+        if (may_reuse_main_rows)
+            calculate_rows_to_zero_out_and_not_due_to_given_terms(X);
+    }
+    const bool reuse_main_effect_cache{cache_matches && may_reuse_main_rows};
+    double active_observation_count{0.0};
+    if (reuse_main_effect_cache)
+        active_observation_count = observation_count_total;
+    else
+        for (Eigen::Index i = 0; i < rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.size(); ++i)
+            active_observation_count += observation_count[rows_to_zero_out_and_not_due_to_given_terms.not_zeroed[i]];
+    bool too_few_observations{active_observation_count <= 0.0 ||
+        active_observation_count < static_cast<double>(min_observations_in_split)};
     if (too_few_observations)
     {
         make_term_ineligible();
         return;
     }
 
-    initialize_parameters_in_estimate_split_point(bins, v, min_observations_in_split, linear_effects_only_in_this_boosting_step,
+    initialize_parameters_in_estimate_split_point(bins, v, min_observations_in_split, active_observation_count,
+                                                  linear_effects_only_in_this_boosting_step,
                                                   penalty_for_non_linearity, penalty_for_interactions, ridge_penalty, ridge_penalty_weight);
     calculate_error_where_given_terms_are_zero(negative_gradient, sample_weight);
-    sort_vectors_ascending_by_base_term(X, negative_gradient, sample_weight);
+    sort_vectors_ascending_by_base_term(X, negative_gradient, sample_weight, observation_count);
+    if (!reuse_main_effect_cache)
+        cached_active_rows = rows_to_zero_out_and_not_due_to_given_terms.not_zeroed;
+    cached_base_term = base_term;
+    cached_bins = bins;
+    cached_min_observations_in_split = min_observations_in_split;
     if (!estimate_coefficient_only)
     {
         setup_bins();
@@ -326,6 +397,7 @@ void Term::calculate_error_where_given_terms_are_zero(const VectorXd &negative_g
 }
 
 void Term::initialize_parameters_in_estimate_split_point(size_t bins, double v, size_t min_observations_in_split,
+                                                         double observation_count_total,
                                                          bool linear_effects_only_in_this_boosting_step, double penalty_for_non_linearity,
                                                          double penalty_for_interactions, double ridge_penalty, double ridge_penalty_weight)
 {
@@ -336,36 +408,63 @@ void Term::initialize_parameters_in_estimate_split_point(size_t bins, double v, 
     this->penalty_for_interactions = penalty_for_interactions;
     this->ridge_penalty = ridge_penalty;
     this->ridge_penalty_weight = ridge_penalty_weight;
+    this->observation_count_total = observation_count_total;
     adjust_min_observations_in_split_to_avoid_computational_errors(min_observations_in_split);
-    max_index = calculate_max_index_in_vector(rows_to_zero_out_and_not_due_to_given_terms.not_zeroed);
+    if (rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.size() > 0)
+        max_index = calculate_max_index_in_vector(rows_to_zero_out_and_not_due_to_given_terms.not_zeroed);
 }
 
 void Term::adjust_min_observations_in_split_to_avoid_computational_errors(size_t min_observations_in_split)
 {
-    this->min_observations_in_split = std::min(min_observations_in_split, static_cast<size_t>(rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.size()));
-    this->min_observations_in_split = std::max(min_observations_in_split, static_cast<size_t>(1));
+    this->min_observations_in_split = std::min(min_observations_in_split, static_cast<size_t>(observation_count_total));
+    this->min_observations_in_split = std::max(this->min_observations_in_split, static_cast<size_t>(1));
 }
 
-void Term::sort_vectors_ascending_by_base_term(const MatrixXd &X, const VectorXd &negative_gradient, const VectorXd &sample_weight)
+void Term::sort_vectors_ascending_by_base_term(const MatrixXd &X, const VectorXd &negative_gradient, const VectorXd &sample_weight,
+                                               const VectorXd &observation_count)
 {
-    bool rows_need_to_be_zeroed_due_to_given_terms{rows_to_zero_out_and_not_due_to_given_terms.zeroed.size() > 0};
-    if (rows_need_to_be_zeroed_due_to_given_terms)
+    // Main effects always see the same rows within one CV fold. Interaction
+    // gates can change when redundant given terms are pruned, so keep their
+    // existing exhaustive sort behavior.
+    bool can_cache_sort_order{given_terms.empty()};
+    bool sort_order_is_not_cached{!can_cache_sort_order || sorted_vectors.row_indexes_sorted.size() == 0};
+    if (sort_order_is_not_cached)
     {
-        VectorXd values_subset(rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.size());
-        VectorXd negative_gradient_subset(rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.size());
-        VectorXd sample_weight_subset(rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.size());
-        size_t count{0};
-        for (size_t i = 0; i <= max_index; ++i)
+        bool rows_need_to_be_zeroed_due_to_given_terms{rows_to_zero_out_and_not_due_to_given_terms.zeroed.size() > 0};
+        if (rows_need_to_be_zeroed_due_to_given_terms)
         {
-            values_subset[count] = X.col(base_term)[rows_to_zero_out_and_not_due_to_given_terms.not_zeroed[i]];
-            negative_gradient_subset[count] = negative_gradient[rows_to_zero_out_and_not_due_to_given_terms.not_zeroed[i]];
-            sample_weight_subset[count] = sample_weight[rows_to_zero_out_and_not_due_to_given_terms.not_zeroed[i]];
-            ++count;
+            VectorXd values_subset(rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.size());
+            for (Eigen::Index i = 0; i < rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.size(); ++i)
+                values_subset[i] = X(rows_to_zero_out_and_not_due_to_given_terms.not_zeroed[i], base_term);
+            VectorXi subset_order{sort_indexes_ascending(values_subset)};
+            sorted_vectors.row_indexes_sorted.resize(subset_order.size());
+            for (Eigen::Index i = 0; i < subset_order.size(); ++i)
+                sorted_vectors.row_indexes_sorted[i] = rows_to_zero_out_and_not_due_to_given_terms.not_zeroed[subset_order[i]];
         }
-        sorted_vectors = sort_data(values_subset, negative_gradient_subset, sample_weight_subset);
+        else
+            sorted_vectors.row_indexes_sorted = sort_indexes_ascending(X.col(base_term));
     }
-    else
-        sorted_vectors = sort_data(X.col(base_term), negative_gradient, sample_weight);
+
+    bool static_data_is_not_cached{!can_cache_sort_order || !static_main_effect_data_cached};
+    if (static_data_is_not_cached)
+        sorted_vectors.values_sorted.resize(sorted_vectors.row_indexes_sorted.size());
+    bool observation_counts_are_needed{static_data_is_not_cached};
+    if (observation_counts_are_needed)
+        sorted_vectors.observation_count_sorted.resize(sorted_vectors.row_indexes_sorted.size());
+    sorted_vectors.negative_gradient_sorted.resize(sorted_vectors.row_indexes_sorted.size());
+    sorted_vectors.sample_weight_sorted.resize(sorted_vectors.row_indexes_sorted.size());
+    for (Eigen::Index i = 0; i < sorted_vectors.row_indexes_sorted.size(); ++i)
+    {
+        Eigen::Index row_index{sorted_vectors.row_indexes_sorted[i]};
+        if (static_data_is_not_cached)
+            sorted_vectors.values_sorted[i] = X(row_index, base_term);
+        if (observation_counts_are_needed)
+            sorted_vectors.observation_count_sorted[i] = observation_count[row_index];
+        sorted_vectors.negative_gradient_sorted[i] = negative_gradient[row_index];
+        sorted_vectors.sample_weight_sorted[i] = sample_weight[row_index];
+    }
+    if (can_cache_sort_order)
+        static_main_effect_data_cached = true;
 }
 
 SortedData Term::sort_data(const VectorXd &values_to_sort, const VectorXd &negative_gradient_to_sort, const VectorXd &sample_weight_to_sort)
@@ -398,15 +497,26 @@ void Term::setup_bins()
         if (can_create_bins)
         {
             size_t start_row{min_observations_in_split};
-            size_t end_row{max_index + 1 - min_observations_in_split};
+            size_t end_row{static_cast<size_t>(observation_count_total) - min_observations_in_split};
 
             std::vector<size_t> potential_start_indexes;
+            std::vector<size_t> potential_start_positions;
             potential_start_indexes.reserve(sorted_vectors.values_sorted.size());
-            for (size_t i = start_row; i <= end_row; ++i)
+            potential_start_positions.reserve(sorted_vectors.values_sorted.size());
+            size_t observations_before{0};
+            for (size_t i = 0; i < static_cast<size_t>(sorted_vectors.values_sorted.size()); ++i)
             {
-                bool is_eligible_start_index{i > 0 && !is_approximately_equal(sorted_vectors.values_sorted[i], sorted_vectors.values_sorted[i - 1])};
+                observations_before += static_cast<size_t>(sorted_vectors.observation_count_sorted[i]);
+                size_t next_index{i + 1};
+                bool is_eligible_start_index{
+                    next_index < static_cast<size_t>(sorted_vectors.values_sorted.size()) &&
+                    observations_before >= start_row && observations_before <= end_row &&
+                    !is_approximately_equal(sorted_vectors.values_sorted[next_index], sorted_vectors.values_sorted[i])};
                 if (is_eligible_start_index)
-                    potential_start_indexes.push_back(i);
+                {
+                    potential_start_indexes.push_back(next_index);
+                    potential_start_positions.push_back(observations_before);
+                }
             }
             size_t last_potential_start_index{potential_start_indexes.size() - 1};
 
@@ -431,17 +541,17 @@ void Term::setup_bins()
                 {
                     bins_start_index.push_back(potential_start_indexes[0]); // First bin
 
-                    size_t observations_between_outer_start_indexes{potential_start_indexes[last_potential_start_index] - potential_start_indexes[0]};
+                    size_t observations_between_outer_start_indexes{potential_start_positions[last_potential_start_index] - potential_start_positions[0]};
                     size_t bins_to_create{bins - 2};
-                    size_t desired_observations_in_bin{std::max((observations_between_outer_start_indexes) / bins_to_create + 1, static_cast<size_t>(1))};
+                    size_t desired_observations_in_bin{std::max(observations_between_outer_start_indexes / bins_to_create + 1, static_cast<size_t>(1))};
                     size_t desired_observations_in_second_last_bin{desired_observations_in_bin * 4 / 5};
                     size_t index_of_start_index_for_previous_bin{0};
                     size_t distance;
                     size_t distance_to_end;
                     for (size_t index_of_start_index = 1; index_of_start_index < last_potential_start_index - 1; ++index_of_start_index)
                     {
-                        distance = potential_start_indexes[index_of_start_index] - potential_start_indexes[index_of_start_index_for_previous_bin];
-                        distance_to_end = potential_start_indexes[last_potential_start_index] - potential_start_indexes[index_of_start_index];
+                        distance = potential_start_positions[index_of_start_index] - potential_start_positions[index_of_start_index_for_previous_bin];
+                        distance_to_end = potential_start_positions[last_potential_start_index] - potential_start_positions[index_of_start_index];
                         bool can_add_bin{distance >= desired_observations_in_bin && distance_to_end >= desired_observations_in_second_last_bin};
                         if (can_add_bin)
                         {
@@ -468,15 +578,24 @@ void Term::setup_bins()
 
         bins_split_points_left.reserve(bins_start_index.size());
         bins_split_points_right.reserve(bins_start_index.size());
+        std::vector<size_t> expanded_positions(sorted_vectors.values_sorted.size() + 1, 0);
+        for (size_t i = 0; i < static_cast<size_t>(sorted_vectors.values_sorted.size()); ++i)
+            expanded_positions[i + 1] = expanded_positions[i] +
+                static_cast<size_t>(sorted_vectors.observation_count_sorted[i]);
+        const size_t expanded_max_index{static_cast<size_t>(observation_count_total) - 1};
         for (size_t i = 0; i < bins_start_index.size(); ++i)
         {
-            if (bins_start_index[i] > 0 && bins_start_index[i] < max_index)
+            const size_t expanded_start{expanded_positions[bins_start_index[i]]};
+            const size_t expanded_end{expanded_positions[bins_end_index[i] + 1] - 1};
+            if (expanded_start > 0 && expanded_start < expanded_max_index)
             {
                 bins_split_points_left.push_back(sorted_vectors.values_sorted[bins_start_index[i]]);
+                bins_left_active_count.push_back(i);
             }
-            if (bins_end_index[i] > 0 && bins_end_index[i] < max_index)
+            if (expanded_end > 0 && expanded_end < expanded_max_index)
             {
                 bins_split_points_right.push_back(sorted_vectors.values_sorted[bins_end_index[i]]);
+                bins_right_active_start.push_back(i + 1);
             }
         }
         bins_split_points_left.shrink_to_fit();
@@ -492,8 +611,9 @@ void Term::setup_bins()
 
 void Term::discretize_data_by_bin()
 {
+    // Preserve upstream semantics: bin predictors and bin weight sums are fixed
+    // at their first evaluation; only gradient sums use the current weights.
     bool calculate_if_it_has_not_been_done_before{values_discretized.size() == 0};
-    bool sample_weights_were_provided_by_user{sorted_vectors.sample_weight_sorted.size() > 0};
     if (calculate_if_it_has_not_been_done_before)
     {
         values_discretized.resize(bins_start_index.size());
@@ -505,7 +625,10 @@ void Term::discretize_data_by_bin()
             if (sample_weight_for_bin_is_positive)
                 values_discretized[i] = (sorted_vectors.values_sorted.block(bins_start_index[i], 0, observations_in_bins[i], 1).array() * sorted_vectors.sample_weight_sorted.block(bins_start_index[i], 0, observations_in_bins[i], 1).array()).sum() / sample_weight_discretized[i];
             else
-                values_discretized[i] = sorted_vectors.values_sorted.block(bins_start_index[i], 0, observations_in_bins[i], 1).mean();
+                values_discretized[i] =
+                    (sorted_vectors.values_sorted.segment(bins_start_index[i], observations_in_bins[i]).array() *
+                     sorted_vectors.observation_count_sorted.segment(bins_start_index[i], observations_in_bins[i]).array()).sum() /
+                    sorted_vectors.observation_count_sorted.segment(bins_start_index[i], observations_in_bins[i]).sum();
         }
     }
     negative_gradient_discretized.resize(bins_start_index.size());
@@ -515,7 +638,10 @@ void Term::discretize_data_by_bin()
         if (sample_weight_for_bin_is_positive)
             negative_gradient_discretized[i] = (sorted_vectors.negative_gradient_sorted.block(bins_start_index[i], 0, observations_in_bins[i], 1).array() * sorted_vectors.sample_weight_sorted.block(bins_start_index[i], 0, observations_in_bins[i], 1).array()).sum() / sample_weight_discretized[i];
         else
-            negative_gradient_discretized[i] = sorted_vectors.negative_gradient_sorted.block(bins_start_index[i], 0, observations_in_bins[i], 1).mean();
+            negative_gradient_discretized[i] =
+                (sorted_vectors.negative_gradient_sorted.segment(bins_start_index[i], observations_in_bins[i]).array() *
+                 sorted_vectors.observation_count_sorted.segment(bins_start_index[i], observations_in_bins[i]).array()).sum() /
+                sorted_vectors.observation_count_sorted.segment(bins_start_index[i], observations_in_bins[i]).sum();
     }
     max_index_discretized = calculate_max_index_in_vector(values_discretized);
 }
@@ -543,31 +669,74 @@ void Term::estimate_split_point_on_discretized_data()
     bool non_linear_effects_are_allowed{!linear_effects_only_in_this_boosting_step && std::isless(penalty_for_non_linearity, 1.0)};
     if (non_linear_effects_are_allowed)
     {
+        size_t num_bins{static_cast<size_t>(values_discretized.size())};
+        aplr_internal::update_prefix_moments(
+            prefix_moments, values_discretized, negative_gradient_discretized,
+            sample_weight_discretized);
+        double nonlinear_penalty_factor{1.0 - penalty_for_non_linearity};
+        if (get_interaction_level() > 0)
+            nonlinear_penalty_factor *= 1.0 - penalty_for_interactions;
+
         double split_point_left{NAN_DOUBLE};
         double error_min_left{error_split_point_nan};
-        for (auto bin = bins_split_points_left.rbegin(); bin != bins_split_points_left.rend(); ++bin)
+        approximate_left_scores.resize(bins_split_points_left.size());
+        double left_upper_bound{std::numeric_limits<double>::infinity()};
+        for (size_t i = 0; i < bins_split_points_left.size(); ++i)
         {
-            split_point = *bin;
-            direction_right = false;
-            estimate_coefficient_and_error(calculate_without_interactions(values_discretized), negative_gradient_discretized, sample_weight_discretized);
-            if (std::isless(split_point_search_errors_sum, error_min_left))
+            approximate_left_scores[i] = aplr_internal::score_hinge_from_prefix(
+                prefix_moments, bins_split_points_left[i], 0,
+                bins_left_active_count[i], v, nonlinear_penalty_factor,
+                ridge_penalty, ridge_penalty_weight, monotonic_constraint);
+            const auto &score{approximate_left_scores[i]};
+            if (score.reliable && std::isfinite(score.error))
+                left_upper_bound = std::min(left_upper_bound, score.error + score.error_bound);
+        }
+        for (size_t reverse_index = bins_split_points_left.size(); reverse_index-- > 0;)
+        {
+            const auto &score{approximate_left_scores[reverse_index]};
+            if (!score.reliable || (std::isfinite(score.error) &&
+                score.error - score.error_bound <= left_upper_bound))
             {
-                error_min_left = split_point_search_errors_sum;
-                split_point_left = split_point;
+                split_point = bins_split_points_left[reverse_index];
+                direction_right = false;
+                estimate_coefficient_and_error(calculate_without_interactions(values_discretized), negative_gradient_discretized, sample_weight_discretized);
+                if (std::isless(split_point_search_errors_sum, error_min_left))
+                {
+                    error_min_left = split_point_search_errors_sum;
+                    split_point_left = split_point;
+                }
             }
         }
 
         double split_point_right{NAN_DOUBLE};
         double error_min_right{error_split_point_nan};
-        for (auto &bin : bins_split_points_right)
+        approximate_right_scores.resize(bins_split_points_right.size());
+        double right_upper_bound{std::numeric_limits<double>::infinity()};
+        for (size_t i = 0; i < bins_split_points_right.size(); ++i)
         {
-            split_point = bin;
-            direction_right = true;
-            estimate_coefficient_and_error(calculate_without_interactions(values_discretized), negative_gradient_discretized, sample_weight_discretized);
-            if (std::isless(split_point_search_errors_sum, error_min_right))
+            approximate_right_scores[i] = aplr_internal::score_hinge_from_prefix(
+                prefix_moments, bins_split_points_right[i],
+                bins_right_active_start[i], num_bins, v,
+                nonlinear_penalty_factor, ridge_penalty,
+                ridge_penalty_weight, monotonic_constraint);
+            const auto &score{approximate_right_scores[i]};
+            if (score.reliable && std::isfinite(score.error))
+                right_upper_bound = std::min(right_upper_bound, score.error + score.error_bound);
+        }
+        for (size_t i = 0; i < bins_split_points_right.size(); ++i)
+        {
+            const auto &score{approximate_right_scores[i]};
+            if (!score.reliable || (std::isfinite(score.error) &&
+                score.error - score.error_bound <= right_upper_bound))
             {
-                error_min_right = split_point_search_errors_sum;
-                split_point_right = split_point;
+                split_point = bins_split_points_right[i];
+                direction_right = true;
+                estimate_coefficient_and_error(calculate_without_interactions(values_discretized), negative_gradient_discretized, sample_weight_discretized);
+                if (std::isless(split_point_search_errors_sum, error_min_right))
+                {
+                    error_min_right = split_point_search_errors_sum;
+                    split_point_right = split_point;
+                }
             }
         }
 
@@ -681,10 +850,8 @@ void Term::cleanup_after_estimate_split_point()
 {
     rows_to_zero_out_and_not_due_to_given_terms.not_zeroed.resize(0);
     rows_to_zero_out_and_not_due_to_given_terms.zeroed.resize(0);
-    sorted_vectors.values_sorted.resize(0);
-    sorted_vectors.negative_gradient_sorted.resize(0);
-    sorted_vectors.sample_weight_sorted.resize(0);
-    negative_gradient_discretized.resize(0);
+    // Keep owned scoring buffers for the next call. cleanup_after_fit releases
+    // them, and static-data validation above prevents reuse across changed data.
 }
 
 void Term::determine_if_can_be_used_as_a_given_term(const VectorXd &x)
@@ -708,8 +875,21 @@ void Term::cleanup_after_fit()
     bins_split_points_left.clear();
     bins_split_points_right.clear();
     observations_in_bins.clear();
+    bins_left_active_count.clear();
+    bins_right_active_start.clear();
+    prefix_moments = aplr_internal::PrefixMoments{};
+    approximate_left_scores.clear();
+    approximate_right_scores.clear();
+    cached_active_rows.resize(0);
     values_discretized.resize(0);
     sample_weight_discretized.resize(0);
+    sorted_vectors.values_sorted.resize(0);
+    sorted_vectors.observation_count_sorted.resize(0);
+    sorted_vectors.row_indexes_sorted.resize(0);
+    sorted_vectors.negative_gradient_sorted.resize(0);
+    sorted_vectors.sample_weight_sorted.resize(0);
+    negative_gradient_discretized.resize(0);
+    static_main_effect_data_cached = false;
 }
 
 void Term::cleanup_when_this_term_was_added_as_a_given_term()
